@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 
 import numpy as np
+from nicegui import run as ng_run
 from nicegui import ui
 from scipy import signal
 
 import codegen
+import ctest
 import fdcore
+import presets
 
 TYPE_LABELS = {"lowpass": "Lowpass", "highpass": "Highpass", "bandpass": "Bandpass", "bandstop": "Bandstop"}
 CHAR_LABELS = {"butterworth": "Butterworth", "chebyshev": "Chebyshev (type I)", "elliptic": "Elliptic (Cauer)"}
@@ -104,7 +108,8 @@ def line(name: str, data: list, color: str, dashed: bool = False, width: float =
             "itemStyle": {"color": color}}
 
 
-TAB_NAMES = ["Magnitude", "Phase", "Group delay", "Pole / zero", "Impulse / step", "Sections", "C code"]
+TAB_NAMES = ["Magnitude", "Phase", "Group delay", "Pole / zero", "Impulse / step", "Sections", "C code", "C test"]
+IMPL_COLORS = {"float": "#a78bfa", "double": "#34d399", "fixed32": "#fbbf24", "fixed16": "#f472b6"}
 
 
 @ui.page("/")
@@ -120,6 +125,9 @@ def index(tab: str = "magnitude") -> None:
         "edges": {t: None for t in EDGE_LAYOUT},
         "design": None,
         "timer": None,
+        "preset": presets.DEFAULT_NAME,   # current parameter file
+        "dirty": False,                   # parameters changed since load/save
+        "loading": False,                 # suppresses reactions while a parameter set is applied
     }
     # initial bandpass edges like the firmware example
     state["edges"]["bandpass"] = [400.0, 800.0, 1200.0, 1800.0]
@@ -137,6 +145,19 @@ def index(tab: str = "magnitude") -> None:
     with ui.row().classes("w-full no-wrap items-start gap-4 p-4"):
         # ============================================================== left panel
         with ui.column().classes("w-80 shrink-0 gap-3"):
+            with ui.card().classes("w-full gap-1"):
+                with ui.row().classes("w-full items-center no-wrap"):
+                    ui.label("Parameter set").classes("text-base font-semibold")
+                    ui.space()
+                    preset_state = ui.label("").classes("text-xs opacity-70")
+                with ui.row().classes("w-full items-center no-wrap gap-1"):
+                    preset_sel = ui.select([], label="Load from presets folder").props("dense").classes("grow")
+                    preset_refresh = ui.button(icon="refresh").props("flat round dense").tooltip(
+                        "Rescan the presets folder")
+                with ui.row().classes("w-full no-wrap gap-1"):
+                    save_btn = ui.button("Save", icon="save").props("dense flat no-caps")
+                    save_as_btn = ui.button("Save as", icon="save_as").props("dense flat no-caps")
+                    load_file_btn = ui.button("Load file", icon="upload_file").props("dense flat no-caps")
             with ui.card().classes("w-full"):
                 ui.label("Specification").classes("text-base font-semibold")
                 type_sel = ui.select(TYPE_LABELS, value="bandpass", label="Filter type").props("dense").classes("w-full")
@@ -175,7 +196,8 @@ def index(tab: str = "magnitude") -> None:
                 t_time = ui.tab("Impulse / step")
                 t_sec = ui.tab("Sections")
                 t_code = ui.tab("C code")
-            tab_widgets = [t_mag, t_phase, t_gd, t_pz, t_time, t_sec, t_code]
+                t_test = ui.tab("C test")
+            tab_widgets = [t_mag, t_phase, t_gd, t_pz, t_time, t_sec, t_code, t_test]
             wanted = next((w for w, n in zip(tab_widgets, TAB_NAMES)
                            if n.lower().replace(" ", "").replace("/", "").startswith(tab.lower())), t_mag)
             with ui.tab_panels(tabs, value=wanted).classes("w-full"):
@@ -214,6 +236,31 @@ def index(tab: str = "magnitude") -> None:
                         with ui.column().classes("w-1/2 min-w-0"):
                             c_title = ui.label("").classes("font-mono text-sm")
                             c_code = ui.code("", language="c").classes("w-full text-xs")
+                with ui.tab_panel(t_test):
+                    with ui.row().classes("w-full items-end gap-3"):
+                        test_impls = ui.select(ARITH_LABELS, multiple=True, value=list(ARITH_LABELS),
+                                               label="Implementations").props("dense use-chips").classes("min-w-[340px]")
+                        test_sig = ui.select(ctest.SIGNALS, value="noise", label="Signal").props("dense").classes("w-44")
+                        test_f1 = ui.number("f1", value=1000, min=0, suffix="Hz", format="%.6g").props("dense").classes("w-28")
+                        test_f2 = ui.number("f2", value=2000, min=0, suffix="Hz", format="%.6g").props("dense").classes("w-28")
+                        test_amp = ui.number("Amplitude", value=0.9, min=0.0001, max=1, step=0.05, suffix="FS",
+                                             format="%.4g").props("dense").classes("w-28")
+                        test_n = ui.number("Samples", value=2048, min=16, max=65536, step=256,
+                                           format="%d").props("dense").classes("w-28")
+                        test_cc = ui.input("C compiler", value=os.environ.get("CC", "gcc")).props("dense").classes("w-64")
+                    with ui.row().classes("w-full items-center gap-3 mt-2"):
+                        run_btn = ui.button("Compile & run", icon="play_arrow")
+                        tb_btn = ui.button("Test bench (.zip)", icon="download").props("outline")
+                        ui.label("for the selected arithmetic in the Implementation panel").classes("text-sm opacity-70")
+                    test_info = ui.label("Compiles the generated C code of each selected implementation with its test "
+                                         "bench, runs it with the test signal and compares the output with the double "
+                                         "precision reference and the bit-exact fixed-point model."
+                                         ).classes("text-sm opacity-70")
+                    test_table = ui.table(columns=[], rows=[], row_key="impl").classes("w-full").props("dense flat")
+                    test_view = ui.toggle({"out": "output", "err": "error", "freq": "measured magnitude"}, value="out")
+                    test_chart = ui.echart(base_chart("Sample n", "Amplitude")).classes("w-full h-[460px]")
+                    with ui.expansion("Compiler commands and test bench messages", icon="terminal").classes("w-full"):
+                        test_log = ui.code("", language="text").classes("w-full text-xs")
 
     code_files = {"h": ("", ""), "c": ("", "")}
     dl_h.on_click(lambda: ui.download.content(code_files["h"][1], code_files["h"][0]))
@@ -245,25 +292,17 @@ def index(tab: str = "magnitude") -> None:
                            fpass=fpass, fstop=fstop, ap=float(ap_in.value or 0), as_=float(as_in.value or 0))
 
     def implementation(d: fdcore.Design):
-        sos = fdcore.scale_sections(d.sos, d.spec.fs) if scale_chk.value else d.sos.copy()
         arith = arith_sel.value
-        fixed = None
-        if arith.startswith("fixed"):
-            word = int(arith[5:])
-            frac = fdcore.auto_frac_bits(sos, word)
-            if auto_q.value:
-                frac_in.set_value(frac)
-            else:
-                frac = int(max(0, min(word - 1, frac_in.value or 0)))
-            fixed = fdcore.quantize(sos, word, frac)
-            impl_sos = fixed.as_float_sos()
-        elif arith == "float":
-            impl_sos = sos.astype(np.float32).astype(float)
-        else:
-            impl_sos = sos
+        frac = None
+        if arith.startswith("fixed") and not auto_q.value:
+            frac = int(frac_in.value or 0)
+        sos, fixed, impl_sos = fdcore.implement(d.sos, d.spec.fs, arith, scale_chk.value, frac)
+        if fixed is not None and auto_q.value:
+            frac_in.set_value(fixed.frac)
         return sos, fixed, impl_sos
 
     def schedule(*_):
+        mark_dirty()
         if state["timer"] is not None:
             state["timer"].cancel()
         state["timer"] = ui.timer(0.3, update, once=True)
@@ -368,6 +407,8 @@ def index(tab: str = "magnitude") -> None:
         h_code.content, c_code.content = files[1], files[3]
         code_note.text = (f"{ARITH_LABELS[arith_sel.value]}, {len(sos)} sections"
                           + (", section scaling" if scale_chk.value else ""))
+        if state.get("test") is not None:
+            render_test()
 
     # ------------------------------------------------------------------ renderers
     def show(chart, opt: dict) -> None:
@@ -551,6 +592,157 @@ def index(tab: str = "magnitude") -> None:
             + f"Worst case input-to-node gain (L1 norm) is {l1max:.2f}, so "
             + f"{max(0, math.ceil(math.log2(l1max))) if l1max > 0 else 0} bit(s) of headroom avoid any overflow.")
 
+    # ------------------------------------------------------------------ C test
+    def frac_override() -> dict:
+        """Manual Q of the Implementation panel applies to the selected fixed-point arithmetic."""
+        if arith_sel.value.startswith("fixed") and not auto_q.value:
+            return {arith_sel.value: int(frac_in.value or 0)}
+        return {}
+
+    def test_args() -> dict:
+        return {"kind": test_sig.value, "n": int(test_n.value or 2048),
+                "amplitude": float(min(max(test_amp.value or 0.9, 1e-4), 1.0)),
+                "f1": float(test_f1.value or 0), "f2": float(test_f2.value or 0)}
+
+    async def run_test() -> None:
+        d = state["design"]
+        if d is None:
+            ui.notify("No valid design to test.", type="warning")
+            return
+        cc = ctest.find_compiler(test_cc.value)
+        if cc is None:
+            ui.notify(f"C compiler '{test_cc.value}' not found.", type="negative")
+            return
+        ariths = [a for a in fdcore.ARITHMETICS if a in (test_impls.value or [])]
+        if not ariths:
+            ui.notify("Select at least one implementation.", type="warning")
+            return
+        a = test_args()
+        run_btn.props("loading")
+        try:
+            tr = await ng_run.io_bound(ctest.run_tests, d, ariths, a["kind"], a["n"], a["amplitude"],
+                                       a["f1"], a["f2"], cc, scale_chk.value, frac_override())
+        finally:
+            run_btn.props(remove="loading")
+        state["test"] = (tr, d)
+        render_test()
+        failed = [r.arith for r in tr.results if not r.ok or r.testbench_pass is False or r.bit_exact is False]
+        ui.notify("All implementations passed." if not failed else f"Check: {', '.join(failed)}",
+                  type="positive" if not failed else "warning")
+
+    def download_testbench() -> None:
+        d = state["design"]
+        if d is None:
+            return
+        a = test_args()
+        name = name_in.value or "iir_filter"
+        frac = frac_override().get(arith_sel.value)
+        data = ctest.testbench_zip(d, name, arith_sel.value, a["kind"], a["n"], a["amplitude"],
+                                   a["f1"], a["f2"], scale_chk.value, frac)
+        ui.download.content(data, f"{codegen.c_identifier(name)}_{arith_sel.value}_testbench.zip",
+                            "application/zip")
+
+    def fmt_num(v: float | None, spec: str = ".3g") -> str:
+        if v is None:
+            return "–"
+        if isinstance(v, float) and math.isinf(v):
+            return "∞"
+        if isinstance(v, float) and math.isnan(v):
+            return "–"
+        return format(v, spec)
+
+    def render_test() -> None:
+        tr, d_test = state["test"]
+        stale = d_test is not state["design"]
+        sig = ctest.SIGNALS[tr.signal]
+        test_info.text = (f"Results for {d_test.spec.characteristic} {d_test.spec.type}, order "
+                          f"{d_test.digital_order}: {sig}, {tr.n} samples, amplitude {tr.amplitude:g} FS"
+                          + ("  —  the design has changed since this test, run it again." if stale else ""))
+        cols = [{"name": "impl", "label": "Implementation", "field": "impl", "align": "left"},
+                {"name": "build", "label": "Build", "field": "build", "align": "center"},
+                {"name": "tb", "label": "Test bench", "field": "tb", "align": "center"},
+                {"name": "exact", "label": "Bit-exact vs. model", "field": "exact", "align": "center"},
+                {"name": "q", "label": "Format", "field": "q", "align": "right"},
+                {"name": "sat", "label": "Saturations", "field": "sat", "align": "right"},
+                {"name": "maxerr", "label": "Max |error|", "field": "maxerr", "align": "right"},
+                {"name": "lsb", "label": "Max |error| (LSB)", "field": "lsb", "align": "right"},
+                {"name": "rms", "label": "RMS error", "field": "rms", "align": "right"},
+                {"name": "snr", "label": "SNR (dB)", "field": "snr", "align": "right"}]
+        rows, log = [], []
+        for r in tr.results:
+            ok = "✔" if r.ok else "✘"
+            rows.append({
+                "impl": ARITH_LABELS[r.arith], "build": ok,
+                "tb": "–" if r.testbench_pass is None else ("PASS" if r.testbench_pass else "FAIL"),
+                "exact": "–" if r.bit_exact is None else ("✔" if r.bit_exact else "✘"),
+                "q": (f"Q{r.frac}" if r.frac is not None else r.arith),
+                "sat": "–" if r.saturations is None else str(r.saturations),
+                "maxerr": fmt_num(r.max_err), "lsb": fmt_num(r.max_err / r.lsb, ".1f") if r.lsb and r.ok else "–",
+                "rms": fmt_num(r.rms_err), "snr": fmt_num(r.snr_db, ".1f"),
+            })
+            log.append(f"[{r.arith}] {r.compile_cmd}".rstrip())
+            if r.testbench_msg:
+                log.append(f"[{r.arith}] test bench: {r.testbench_msg}")
+            if r.message:
+                log.append(f"[{r.arith}] ERROR: {r.message}")
+        test_table.columns = cols
+        test_table.rows = rows
+        test_table.update()
+        test_log.content = "\n".join(log)
+
+        ok = [r for r in tr.results if r.ok]
+        view = test_view.value
+        if view == "freq":
+            spec = d_test.spec
+            opt = base_chart("Frequency (Hz)", "Magnitude (dB)")
+            bottom = -10 * math.ceil((spec.as_ + 60) / 10)
+            opt["xAxis"].update({"min": 0, "max": r6(spec.fs / 2)})
+            opt["yAxis"].update({"min": bottom, "max": 5})
+            opt["series"].append(line("Design", xy(tr.f_design, fdcore.magnitude_db(tr.h_design)), P()["design"]))
+            for r in ok:
+                opt["series"].append(line(f"{r.arith} (C)", xy(r.f_meas, fdcore.magnitude_db(r.h_meas)),
+                                          IMPL_COLORS[r.arith], dashed=True, width=1.5))
+        else:
+            n_show = min(tr.n, 4096)
+            k = np.arange(n_show)
+            opt = base_chart("Sample n", "Amplitude (FS)" if view == "out" else "Error (FS)")
+            opt["xAxis"].update({"min": 0, "max": n_show - 1})
+            if ok and view == "out":
+                opt["series"].append(line("Input", xy(k, ok[0].x[:n_show]), P()["circle"], width=1))
+                opt["series"].append(line("Reference (double)", xy(k, ok[0].ref[:n_show]), P()["design"]))
+            for r in ok:
+                y = r.y[:n_show] if view == "out" else (r.y - r.ref)[:n_show]
+                opt["series"].append(line(f"{r.arith} (C)", xy(k, y), IMPL_COLORS[r.arith],
+                                          dashed=view == "out", width=1.5))
+            if tr.n > n_show:
+                opt["title"] = {"text": f"first {n_show} of {tr.n} samples", "right": 60, "top": 5,
+                                "textStyle": {"fontSize": 12, "color": P()["fg"]}}
+        show(test_chart, opt)
+
+    def update_test_inputs(_=None) -> None:
+        kind = test_sig.value
+        test_f1.set_visibility(kind in ("sine", "chirp", "multitone"))
+        test_f2.set_visibility(kind in ("chirp", "multitone"))
+
+    def default_test_freqs() -> None:
+        """Sine at the passband center, second tone in the stopband."""
+        s = read_spec()
+        if s.type == "lowpass":
+            f1, f2 = s.fpass[0] / 2, s.fstop[0] * 1.2
+        elif s.type == "highpass":
+            f1, f2 = (s.fpass[0] + s.fs / 2) / 2, s.fstop[0] / 2
+        elif s.type == "bandpass":
+            f1, f2 = math.sqrt(s.fpass[0] * s.fpass[1]), s.fstop[1] * 1.1
+        else:
+            f1, f2 = s.fpass[0] / 2, math.sqrt(s.fstop[0] * s.fstop[1])
+        test_f1.set_value(round(min(f1, 0.49 * s.fs), 3))
+        test_f2.set_value(round(min(f2, 0.49 * s.fs), 3))
+
+    run_btn.on_click(run_test)
+    tb_btn.on_click(download_testbench)
+    test_sig.on_value_change(update_test_inputs)
+    test_view.on_value_change(lambda: render_test() if state.get("test") is not None else None)
+
     # ------------------------------------------------------------------ wiring
     def on_type_change(_=None):
         load_edges()
@@ -559,6 +751,7 @@ def index(tab: str = "magnitude") -> None:
     def toggle_theme():
         dark.value = not dark.value
         theme_btn.props(f'icon={"light_mode" if dark.value else "dark_mode"}')
+        mark_dirty()
         update()
 
     theme_btn.on_click(toggle_theme)
@@ -570,7 +763,270 @@ def index(tab: str = "magnitude") -> None:
         w.on_value_change(schedule)
     frac_in.bind_enabled_from(auto_q, "value", backward=lambda v: not v)
 
+    type_sel.on_value_change(default_test_freqs)
+
+    # ------------------------------------------------------------------ parameter sets (JSON)
+    def collect_params() -> dict:
+        read_spec()   # stores the visible edges in state["edges"]
+        return {
+            "spec": {
+                "type": type_sel.value, "characteristic": char_sel.value, "fs": fs_in.value,
+                "ap": ap_in.value, "as": as_in.value,
+                "edges": {t: v for t, v in state["edges"].items() if v is not None},
+            },
+            "implementation": {
+                "arithmetic": arith_sel.value, "section_scaling": scale_chk.value, "auto_q": auto_q.value,
+                "frac_bits": int(frac_in.value or 0), "c_name": name_in.value,
+            },
+            "view": {
+                "dark": dark.value, "magnitude_scale": mag_scale.value, "frequency_axis": mag_xlog.value,
+                "tolerance_scheme": mag_mask.value, "implemented_response": mag_impl.value,
+                "phase": phase_wrap.value, "group_delay_unit": gd_unit.value, "time_response": time_kind.value,
+                "test_view": test_view.value,
+            },
+            "test": {
+                "implementations": list(test_impls.value or []), "signal": test_sig.value,
+                "f1": test_f1.value, "f2": test_f2.value, "amplitude": test_amp.value,
+                "samples": int(test_n.value or 0), "compiler": test_cc.value,
+            },
+        }
+
+    def apply_params(p: dict) -> list[str]:
+        """Sets all widgets from a parameter set; invalid or missing entries keep their value."""
+        warnings: list[str] = []
+
+        def pick(section: str, key: str, conv, ok=lambda v: True):
+            raw = (p.get(section) or {}).get(key)
+            if raw is None:
+                return None
+            try:
+                v = conv(raw)
+            except (TypeError, ValueError):
+                v = None
+            if v is None or not ok(v):
+                warnings.append(f"{section}.{key}: invalid value {raw!r} ignored")
+                return None
+            return v
+
+        def put(widget, value) -> None:
+            if value is not None:
+                widget.set_value(value)
+
+        boolean = lambda v: v if isinstance(v, bool) else None
+        state["loading"] = True
+        try:
+            for t, vals in ((p.get("spec") or {}).get("edges") or {}).items():
+                try:
+                    if t in EDGE_LAYOUT and len(vals) == len(EDGE_LAYOUT[t]):
+                        state["edges"][t] = [float(v) for v in vals]
+                    else:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    warnings.append(f"spec.edges.{t}: invalid value ignored")
+            put(fs_in, pick("spec", "fs", float, lambda v: v > 0))
+            put(type_sel, pick("spec", "type", str, lambda v: v in TYPE_LABELS))
+            load_edges()
+            put(char_sel, pick("spec", "characteristic", str, lambda v: v in CHAR_LABELS))
+            put(ap_in, pick("spec", "ap", float, lambda v: v > 0))
+            put(as_in, pick("spec", "as", float, lambda v: v > 0))
+
+            put(arith_sel, pick("implementation", "arithmetic", str, lambda v: v in ARITH_LABELS))
+            put(scale_chk, pick("implementation", "section_scaling", boolean))
+            put(auto_q, pick("implementation", "auto_q", boolean))
+            put(frac_in, pick("implementation", "frac_bits", int, lambda v: 0 <= v <= 31))
+            put(name_in, pick("implementation", "c_name", str))
+
+            d = pick("view", "dark", boolean)
+            if d is not None and d != dark.value:
+                dark.value = d
+                theme_btn.props(f'icon={"light_mode" if dark.value else "dark_mode"}')
+            put(mag_scale, pick("view", "magnitude_scale", str, lambda v: v in ("db", "lin")))
+            put(mag_xlog, pick("view", "frequency_axis", str, lambda v: v in ("lin", "log")))
+            put(mag_mask, pick("view", "tolerance_scheme", boolean))
+            put(mag_impl, pick("view", "implemented_response", boolean))
+            put(phase_wrap, pick("view", "phase", str, lambda v: v in ("unwrap", "wrap")))
+            put(gd_unit, pick("view", "group_delay_unit", str, lambda v: v in ("samples", "ms")))
+            put(time_kind, pick("view", "time_response", str, lambda v: v in ("impulse", "step")))
+            put(test_view, pick("view", "test_view", str, lambda v: v in ("out", "err", "freq")))
+
+            put(test_impls, pick("test", "implementations", lambda v: [a for a in v if a in ARITH_LABELS]))
+            put(test_sig, pick("test", "signal", str, lambda v: v in ctest.SIGNALS))
+            put(test_f1, pick("test", "f1", float, lambda v: v >= 0))
+            put(test_f2, pick("test", "f2", float, lambda v: v >= 0))
+            put(test_amp, pick("test", "amplitude", float, lambda v: 0 < v <= 1))
+            put(test_n, pick("test", "samples", int, lambda v: 16 <= v <= 65536))
+            put(test_cc, pick("test", "compiler", str, lambda v: bool(v.strip())))
+            update_test_inputs()
+            schedule()
+        finally:
+            state["loading"] = False
+        return warnings
+
+    def mark_dirty(*_) -> None:
+        if state["loading"] or state["dirty"]:
+            return
+        state["dirty"] = True
+        refresh_preset_label()
+
+    def refresh_preset_label() -> None:
+        if not presets.exists(state["preset"]):
+            suffix = " • not saved in folder"
+        elif state["dirty"]:
+            suffix = " • modified"
+        else:
+            suffix = ""
+        preset_state.text = state["preset"] + suffix
+
+    def refresh_list() -> None:
+        names = presets.list_presets()
+        state["loading"] = True
+        try:
+            preset_sel.set_options(names, value=state["preset"] if state["preset"] in names else None)
+        finally:
+            state["loading"] = False
+
+    def finish_load(name: str, warnings: list[str], dirty: bool = False) -> None:
+        state["preset"] = name
+        state["dirty"] = dirty
+        refresh_list()
+        refresh_preset_label()
+        if warnings:
+            ui.notify(f"{name} loaded with warnings: " + "; ".join(warnings), type="warning", multi_line=True)
+        else:
+            ui.notify(f"{name} loaded", type="positive")
+
+    with ui.dialog() as confirm_dlg, ui.card():
+        confirm_text = ui.label("")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=lambda: confirm_dlg.submit(False)).props("flat")
+            ui.button("Discard changes", on_click=lambda: confirm_dlg.submit(True)).props("color=negative")
+
+    async def confirm_discard() -> bool:
+        if not state["dirty"]:
+            return True
+        confirm_text.text = f"The parameters of {state['preset']} have unsaved changes. Discard them?"
+        return bool(await confirm_dlg)
+
+    async def on_preset_selected(e) -> None:
+        if state["loading"] or not e.value or e.value == state["preset"] and not state["dirty"]:
+            return
+        if not await confirm_discard():
+            refresh_list()
+            return
+        try:
+            data = presets.read(e.value)
+        except presets.PresetError as ex:
+            ui.notify(str(ex), type="negative")
+            refresh_list()
+            return
+        finish_load(presets.sanitize(e.value), apply_params(data))
+
+    def save() -> None:
+        try:
+            path = presets.write(state["preset"], collect_params())
+        except (OSError, presets.PresetError) as ex:
+            ui.notify(f"Save failed: {ex}", type="negative")
+            return
+        state["dirty"] = False
+        refresh_list()
+        refresh_preset_label()
+        ui.notify(f"Saved {path}", type="positive")
+
+    with ui.dialog() as save_dlg, ui.card().classes("w-96"):
+        ui.label("Save parameter set as").classes("text-base font-semibold")
+        save_name = ui.input("File name").props("dense autofocus").classes("w-full")
+        save_hint = ui.label("").classes("text-xs opacity-70 break-all")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=save_dlg.close).props("flat")
+            save_ok = ui.button("Save", icon="save")
+
+    def update_save_hint(*_) -> None:
+        try:
+            name = presets.sanitize(save_name.value or "")
+        except presets.PresetError:
+            save_hint.text = "Enter a file name."
+            save_ok.disable()
+            return
+        save_ok.enable()
+        save_hint.text = (f"{presets.PRESET_DIR / name}"
+                          + ("  —  exists and will be overwritten" if presets.exists(name) else ""))
+
+    def do_save_as(*_) -> None:
+        try:
+            name = presets.sanitize(save_name.value or "")
+            path = presets.write(name, collect_params())
+        except (OSError, presets.PresetError) as ex:
+            ui.notify(f"Save failed: {ex}", type="negative")
+            return
+        save_dlg.close()
+        state["preset"] = name
+        state["dirty"] = False
+        refresh_list()
+        refresh_preset_label()
+        ui.notify(f"Saved {path}", type="positive")
+
+    def open_save_as() -> None:
+        save_name.set_value(state["preset"][:-5] if state["preset"].endswith(".json") else state["preset"])
+        update_save_hint()
+        save_dlg.open()
+
+    with ui.dialog() as upload_dlg, ui.card().classes("w-96"):
+        ui.label("Load parameter set from file").classes("text-base font-semibold")
+        uploader = ui.upload(auto_upload=True, max_files=1).props('accept=".json" flat bordered').classes("w-full")
+        ui.label("The file is loaded but not copied into the presets folder. Use Save to store it there."
+                 ).classes("text-xs opacity-70")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Close", on_click=upload_dlg.close).props("flat")
+
+    async def on_upload(e) -> None:
+        try:
+            data = presets.check(await e.file.json())
+            name = presets.sanitize(e.file.name)
+        except (ValueError, presets.PresetError) as ex:
+            ui.notify(f"{e.file.name}: {ex}", type="negative")
+            return
+        finally:
+            uploader.reset()
+        if not await confirm_discard():
+            return
+        upload_dlg.close()
+        finish_load(name, apply_params(data), dirty=not presets.exists(name))
+
+    preset_sel.tooltip(str(presets.PRESET_DIR))
+    preset_sel.on_value_change(on_preset_selected)
+    preset_refresh.on_click(lambda: (refresh_list(), refresh_preset_label()))
+    save_btn.on_click(save)
+    save_as_btn.on_click(open_save_as)
+    save_name.on_value_change(update_save_hint)
+    save_name.on("keydown.enter", do_save_as)
+    save_ok.on_click(do_save_as)
+    load_file_btn.on_click(upload_dlg.open)
+    uploader.on_upload(on_upload)
+    for w in (test_impls, test_sig, test_f1, test_f2, test_amp, test_n, test_cc, test_view):
+        w.on_value_change(mark_dirty)
+
+    # ------------------------------------------------------------------ start: load default.json
     load_edges()
+    default_test_freqs()
+    update_test_inputs()
+    if presets.exists(presets.DEFAULT_NAME):
+        try:
+            warnings = apply_params(presets.read(presets.DEFAULT_NAME))
+            if warnings:
+                ui.notify("default.json: " + "; ".join(warnings), type="warning", multi_line=True)
+        except presets.PresetError as ex:
+            ui.notify(f"default.json not loaded: {ex}", type="negative")
+    else:
+        try:
+            presets.write(presets.DEFAULT_NAME, collect_params())
+        except OSError as ex:
+            ui.notify(f"Cannot create default.json: {ex}", type="warning")
+    state["dirty"] = False
+    refresh_list()
+    refresh_preset_label()
+    if state["timer"] is not None:
+        state["timer"].cancel()
+        state["timer"] = None
     update()
 
 
@@ -580,7 +1036,10 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--light", action="store_true", help="start in light mode (default: dark)")
+    ap.add_argument("--presets", metavar="DIR", help=f"folder of the JSON parameter sets (default: {presets.PRESET_DIR})")
     args = ap.parse_args()
+    if args.presets:
+        presets.set_directory(args.presets)
     global START_DARK
     START_DARK = not args.light
     ui.run(title="FilterDesign", host=args.host, port=args.port, show=not args.no_browser, reload=False, favicon="〰️")

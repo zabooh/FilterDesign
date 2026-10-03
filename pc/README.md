@@ -18,7 +18,10 @@ pc/
 └── gui/
     ├── app.py                   NiceGUI application
     ├── fdcore.py                runs fdesign, analysis, fixed-point model
-    ├── codegen.py               C code generator
+    ├── codegen.py               C code generator (filter, test bench, Makefile)
+    ├── ctest.py                 compiles and runs the generated C code ("C test" tab)
+    ├── presets.py               parameter sets as JSON files
+    ├── presets/default.json     parameter set loaded at start
     ├── test_codegen.py          compiles the generated code and compares it with Python
     └── requirements.txt
 ```
@@ -113,14 +116,92 @@ is recomputed on every change.
 | Impulse / step | Time responses of the design and of the implementation (fixed point is simulated bit-exactly) |
 | Sections | Coefficients (fixed point as integers), pole radius, frequency and Q, peak gain and L1 norm at each section output |
 | C code | Generated `.h` and `.c` for download |
+| C test | Compiles and runs the C implementations and compares them with the reference (see below) |
 
 The summary above the tabs shows the order, the achieved attenuation at the band edges, the
 maximum pole radius, the settling time, the group delay and the attenuation reached by the
 quantized implementation. It also shows the number of saturations in a fixed-point impulse test.
 
 Zoom: use the mouse wheel on the frequency axis, box zoom from the toolbox, or the slider below
-the plot. `?tab=phase` (or `group`, `pole`, `impulse`, `sections`, `c`) in the URL opens a tab
-directly.
+the plot. `?tab=phase` (or `group`, `pole`, `impulse`, `sections`, `ccode`, `ctest`) in the URL
+opens a tab directly.
+
+### Parameter sets
+
+All parameters are saved together as a JSON file in the folder `gui/presets/`:
+- the specification, including the band edges of every filter type you have edited
+- the implementation settings
+- the view options, including dark mode
+- the settings of the C test
+
+At start the GUI loads `presets/default.json`. If the file does not exist, it is created from the
+built-in defaults. To change what the GUI starts with, save over `default.json`.
+
+The **Parameter set** card at the top of the left panel offers:
+
+| Control | Function |
+|---|---|
+| Drop-down | Lists the `*.json` files in the presets folder. Selecting a file loads it. The refresh button rescans the folder. |
+| Save | Overwrites the current file |
+| Save as | Saves under a new name in the presets folder. File names are reduced to safe characters, and `.json` is added. |
+| Load file | Loads a JSON file from anywhere. It is not copied into the presets folder until you press Save. |
+
+The card shows the current file name. "modified" means that there are unsaved changes, and
+loading another file then asks whether to discard them. Invalid or missing entries in a file are
+ignored and reported, and the affected fields keep their value.
+
+Use another folder with `python app.py --presets DIR` or the environment variable
+`FDESIGN_PRESETS`. The values in `default.json` take precedence over `--light`.
+
+```json
+{
+  "format": "fdesign-gui", "version": 1,
+  "spec": {"type": "bandpass", "characteristic": "elliptic", "fs": 8000, "ap": 1.0, "as": 40.0,
+           "edges": {"bandpass": [400.0, 800.0, 1200.0, 1800.0]}},
+  "implementation": {"arithmetic": "fixed32", "section_scaling": true, "auto_q": true,
+                     "frac_bits": 30, "c_name": "iir_filter"},
+  "view": {"dark": true, "magnitude_scale": "db", "frequency_axis": "lin", "tolerance_scheme": true,
+           "implemented_response": true, "phase": "unwrap", "group_delay_unit": "samples",
+           "time_response": "impulse", "test_view": "out"},
+  "test": {"implementations": ["float", "double", "fixed32", "fixed16"], "signal": "noise",
+           "f1": 979.8, "f2": 1980.0, "amplitude": 0.9, "samples": 2048, "compiler": "gcc"}
+}
+```
+
+In `spec.edges`, the band edges are listed in ascending frequency order for each filter type. For
+example, bandpass is lower stop, lower pass, upper pass, upper stop.
+
+#### Example parameter sets
+
+All examples meet their specification, also with the quantized coefficients of the selected
+arithmetic. The generated C code passes the C test (bit-exact for fixed point). The only
+exception is the overload demo, which saturates on purpose.
+
+| File | Filter | fs | Arithmetic | Test signal |
+|---|---|---|---|---|
+| `firmware_example_bp_8k` | Elliptic bandpass 800–1200 Hz, 3/40 dB (as in `main.c`) | 8 kHz | fixed32 | noise |
+| `telephone_band_bp_8k` | Chebyshev bandpass 300–3400 Hz, order 14 | 8 kHz | fixed16 | chirp, 0.5 FS |
+| `dtmf_697hz_bp_8k` | Elliptic bandpass around the 697 Hz DTMF tone | 8 kHz | fixed32 | sine |
+| `mains_hum_notch_50hz_1k` | Elliptic bandstop 48–52 Hz | 1 kHz | fixed32 | two tones |
+| `audio_lowpass_48k` | Butterworth lowpass 3 kHz, 60 dB | 48 kHz | float | chirp |
+| `audio_highpass_100hz_48k` | Chebyshev highpass 100 Hz | 48 kHz | float | chirp |
+| `anti_alias_lowpass_44k1` | Elliptic lowpass 9 kHz, 0.1/80 dB, for decimation by 2 | 44.1 kHz | double | chirp |
+| `speech_highpass_16k` | Butterworth highpass 120 Hz | 16 kHz | fixed16 | chirp, 0.5 FS |
+| `overload_demo_speech_hp_fixed16` | Same filter, driven at 0.9 FS: shows saturation in the C test | 16 kHz | fixed16 | chirp, 0.9 FS |
+| `sensor_lowpass_1k_fixed16` | Chebyshev lowpass 10 Hz | 1 kHz | fixed16 | step, 0.5 FS |
+| `motor_current_lowpass_20k` | Chebyshev lowpass 1 kHz, 50 dB | 20 kHz | fixed16 | noise |
+| `vibration_bandpass_10k` | Butterworth bandpass 100–1000 Hz, order 14 | 10 kHz | fixed32 | chirp, 0.5 FS |
+| `ultrasonic_bandpass_40k_200k` | Elliptic bandpass 38–42 kHz | 200 kHz | fixed32 | sine |
+| `wide_bandstop_audio_48k` | Chebyshev bandstop 1.5–4 kHz | 48 kHz | float | chirp |
+
+Two findings from creating these sets:
+- **Headroom:** section scaling only limits the steady-state peak gain. With a chirp or a step,
+  high-order filters overshoot. The worst-case gain (L1 norm in the Sections tab) is 3–4.4 for
+  the telephone, speech and vibration filters. That is why these sets are tested at 0.5 FS.
+- **16-bit coefficients:** Butterworth filters meet their band edges exactly, so they have no
+  margin for coefficient quantization. With 16-bit coefficients, the speech highpass first missed
+  its stopband by 0.6 dB, and the sensor lowpass missed its passband edge by 0.02 dB. The sets
+  were therefore given design margin or a different characteristic.
 
 ### Generated C code
 
@@ -138,6 +219,39 @@ at every section output is 0 dB. Without it, internal nodes of high-order ellipt
 overflow in fixed point. The test showed several hundred saturations, and none with scaling.
 **Auto Q** chooses the largest number of fractional bits for which all coefficients fit.
 
+### Testing the C implementations
+
+The **C test** tab compiles the generated code of the selected implementations (float, double,
+fixed 32 bit, fixed 16 bit) with the host C compiler (`gcc`, or set `CC`). Each implementation
+runs with a test signal: impulse, step, sine, chirp, white noise or two tones, with a chosen
+amplitude and length. The tab then shows:
+
+- a table per implementation with these columns:
+  - build result
+  - test bench verdict (PASS/FAIL)
+  - bit-exact match with the fixed-point model
+  - Q format
+  - number of saturations
+  - max. and RMS error against the double reference (fixed point also in LSB)
+  - SNR
+- plots of the output against the reference, of the error, and of the **measured magnitude
+  response**, computed from the impulse response of the compiled C code. The measured response
+  shows quantization effects such as limit cycles that the coefficient-based response cannot show.
+- the compiler commands and the test bench messages
+
+Compiled programs are cached, so a new test signal does not trigger a recompile. The four
+implementations are built in parallel.
+
+**Test bench (.zip)** downloads, for the arithmetic selected in the Implementation panel:
+- the filter (`.h`, `.c`)
+- a test program `<name>_test.c`
+- a `Makefile`
+- `input.txt` with the test signal
+- `expected.txt` with the reference output (fixed point: bit-exact model)
+
+`make test` builds and runs it. The program prints PASS or FAIL and returns 0 or 1. This way the
+same test also runs with another compiler, for example a cross compiler for the target.
+
 ## Verification
 
 - `fdesign/test/verify.py` designs 4 fixed and 120 random specifications with all three
@@ -145,10 +259,11 @@ overflow in fixed point. The test showed several hundred saturations, and none w
   passband ripple, stopband attenuation, stability and 0 dB peak gain, and the order is
   compared with `buttord`, `cheb1ord` and `ellipord`. Result: 358 passed, 0 failed. 14 designs
   were rejected because their order exceeds the limit.
-- `gui/test_codegen.py` generates code for 5 designs × 4 arithmetics × with and without scaling,
-  compiles it with `gcc -Wall -Wextra -Werror` and compares the output. float and double are
-  compared with `scipy.signal.sosfilt` (relative error below 1e-5 and exactly 0). Fixed point is
-  compared bit-exactly with the Python model the GUI uses.
+- `gui/test_codegen.py` generates code and test bench for 5 designs × 4 arithmetics × with and
+  without scaling. It compiles them the same way as the C test tab, runs them with noise and
+  compares the output. float and double are compared with `scipy.signal.sosfilt` (relative error
+  below 1e-5 and exactly 0). Fixed point is compared bit-exactly with the Python model the GUI
+  uses. In addition, the test bench must report PASS. Result: 40 of 40 passed.
 
 ## Changes compared with the firmware library
 

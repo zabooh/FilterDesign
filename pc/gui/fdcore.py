@@ -277,3 +277,29 @@ def fixed_step_response(fp: FixedPoint, n: int, amplitude: float = 0.5) -> np.nd
     level = int(round(amplitude * full))
     y, _ = fixed_filter(fp, np.full(n, level, dtype=np.int64))
     return y / level
+
+
+ARITHMETICS = ["float", "double", "fixed32", "fixed16"]
+
+
+def implement(design_sos: np.ndarray, fs: float, arith: str, scaled: bool = True,
+              frac: int | None = None) -> tuple[np.ndarray, FixedPoint | None, np.ndarray]:
+    """Builds the implementation of a design for one arithmetic.
+
+    Returns (sos, fixed, impl_sos): the (optionally scaled) cascade, its quantized
+    coefficients for fixed point (else None) and the cascade with the coefficients
+    the target actually uses (float32-rounded / quantized) for response plots.
+    frac=None selects the fractional bits automatically.
+    """
+    sos = scale_sections(design_sos, fs) if scaled else design_sos.copy()
+    fixed = None
+    if arith.startswith("fixed"):
+        word = int(arith[5:])
+        f = auto_frac_bits(sos, word) if frac is None else int(max(0, min(word - 1, frac)))
+        fixed = quantize(sos, word, f)
+        impl_sos = fixed.as_float_sos()
+    elif arith == "float":
+        impl_sos = sos.astype(np.float32).astype(float)
+    else:
+        impl_sos = sos
+    return sos, fixed, impl_sos
