@@ -234,9 +234,20 @@ amplitude and length. The tab then shows:
   - number of saturations
   - max. and RMS error against the double reference (fixed point also in LSB)
   - SNR
-- plots of the output against the reference, of the error, and of the **measured magnitude
-  response**, computed from the impulse response of the compiled C code. The measured response
-  shows quantization effects such as limit cycles that the coefficient-based response cannot show.
+- two more table columns for the **measured frequency response**: the maximum deviation from the
+  design in the passband, and the minimum stopband attenuation compared with the specification
+  (✘ if it is missed)
+- four plot views:
+  - **output** against the reference
+  - **error**
+  - **measured magnitude**, computed from the impulse response of the compiled C code. It shows
+    quantization effects such as limit cycles that the coefficient-based response cannot show.
+  - **deviation from design**: measured minus design in dB, with the stopband shaded
+
+  Accurate implementations lie exactly on top of each other in the magnitude view. Each
+  implementation therefore has its own line pattern, the design is drawn as a wide translucent
+  line underneath, and the deviation view separates the curves. Click a legend entry to hide or
+  show a curve.
 - the compiler commands and the test bench messages
 
 Compiled programs are cached, so a new test signal does not trigger a recompile. The four

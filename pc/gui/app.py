@@ -110,6 +110,33 @@ def line(name: str, data: list, color: str, dashed: bool = False, width: float =
 
 TAB_NAMES = ["Magnitude", "Phase", "Group delay", "Pole / zero", "Impulse / step", "Sections", "C code", "C test"]
 IMPL_COLORS = {"float": "#a78bfa", "double": "#34d399", "fixed32": "#fbbf24", "fixed16": "#f472b6"}
+# distinct line patterns, so that coinciding curves stay distinguishable
+IMPL_DASH = {"float": [10, 6], "double": [2, 4], "fixed32": [14, 4, 2, 4], "fixed16": "solid"}
+
+
+def nice_limits(values, floor_span: float = 1e-12) -> tuple[float, float]:
+    """Rounded axis limits enclosing all finite values (ECharts keeps old limits otherwise)."""
+    v = np.concatenate([np.ravel(np.asarray(x, dtype=float)) for x in values]) if values else np.zeros(1)
+    v = v[np.isfinite(v)]
+    lo, hi = (float(v.min()), float(v.max())) if v.size else (0.0, 1.0)
+    span = max(hi - lo, abs(hi) * 1e-3, floor_span)
+    step = 10 ** math.floor(math.log10(span / 2))
+    lo = math.floor((lo - 0.05 * span) / step) * step
+    hi = math.ceil((hi + 0.05 * span) / step) * step
+    return r6(lo), r6(hi)
+
+
+def band_masks(spec: fdcore.Spec, f: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Boolean masks of the passband and the stopband(s) of a specification."""
+    if spec.type == "lowpass":
+        return f <= spec.fpass[0], f >= spec.fstop[0]
+    if spec.type == "highpass":
+        return f >= spec.fpass[0], f <= spec.fstop[0]
+    if spec.type == "bandpass":
+        return ((f >= spec.fpass[0]) & (f <= spec.fpass[1]),
+                (f <= spec.fstop[0]) | (f >= spec.fstop[1]))
+    return ((f <= spec.fpass[0]) | (f >= spec.fpass[1]),
+            (f >= spec.fstop[0]) & (f <= spec.fstop[1]))
 
 
 @ui.page("/")
@@ -257,8 +284,11 @@ def index(tab: str = "magnitude") -> None:
                                          "precision reference and the bit-exact fixed-point model."
                                          ).classes("text-sm opacity-70")
                     test_table = ui.table(columns=[], rows=[], row_key="impl").classes("w-full").props("dense flat")
-                    test_view = ui.toggle({"out": "output", "err": "error", "freq": "measured magnitude"}, value="out")
-                    test_chart = ui.echart(base_chart("Sample n", "Amplitude")).classes("w-full h-[460px]")
+                    with ui.row().classes("w-full items-center gap-4"):
+                        test_view = ui.toggle({"out": "output", "err": "error", "freq": "measured magnitude",
+                                               "dev": "deviation from design"}, value="out")
+                        ui.label("Click a legend entry to hide or show a curve.").classes("text-xs opacity-70")
+                    test_chart_box = ui.element("div").classes("w-full")
                     with ui.expansion("Compiler commands and test bench messages", icon="terminal").classes("w-full"):
                         test_log = ui.code("", language="text").classes("w-full text-xs")
 
@@ -412,6 +442,8 @@ def index(tab: str = "magnitude") -> None:
 
     # ------------------------------------------------------------------ renderers
     def show(chart, opt: dict) -> None:
+        # note: nicegui merges new options into the old ones while the number of series is
+        # unchanged, so a chart whose views use different axis limits must always set them
         chart.options.clear()
         chart.options.update(apply_theme(opt, P()))
         chart.update()
@@ -446,6 +478,8 @@ def index(tab: str = "magnitude") -> None:
             for a, b in sa:
                 areas.append([{"xAxis": a, "yAxis": stop_lim}, {"xAxis": b, "yAxis": top}])
             series["markArea"] = {"silent": True, "itemStyle": {"color": P()["forbidden"]}, "data": areas}
+        else:
+            series["markArea"] = {"data": []}   # explicit: nicegui would keep the old areas
         opt["series"].append(series)
         if mag_impl.value:
             opt["series"].append(line(f"Implemented ({ARITH_LABELS[arith_sel.value]})", xy(f, yi),
@@ -667,10 +701,21 @@ def index(tab: str = "magnitude") -> None:
                 {"name": "maxerr", "label": "Max |error|", "field": "maxerr", "align": "right"},
                 {"name": "lsb", "label": "Max |error| (LSB)", "field": "lsb", "align": "right"},
                 {"name": "rms", "label": "RMS error", "field": "rms", "align": "right"},
-                {"name": "snr", "label": "SNR (dB)", "field": "snr", "align": "right"}]
+                {"name": "snr", "label": "SNR (dB)", "field": "snr", "align": "right"},
+                {"name": "pdev", "label": "Passband max |Δ| (dB)", "field": "pdev", "align": "right"},
+                {"name": "satt", "label": f"Stopband min. atten. (dB, spec {d_test.spec.as_:g})", "field": "satt",
+                 "align": "right"}]
         rows, log = [], []
         for r in tr.results:
             ok = "✔" if r.ok else "✘"
+            pdev = satt = None
+            if r.ok:
+                pm, sm = band_masks(d_test.spec, r.f_meas)
+                with np.errstate(divide="ignore"):
+                    hd = np.abs(fdcore.response(d_test.sos, r.f_meas, d_test.spec.fs))
+                    dev = 20 * np.log10(r.h_meas + 1e-300) - 20 * np.log10(hd + 1e-300)
+                pdev = float(np.max(np.abs(dev[pm]))) if pm.any() else None
+                satt = float(np.min(-20 * np.log10(r.h_meas[sm] + 1e-300))) if sm.any() else None
             rows.append({
                 "impl": ARITH_LABELS[r.arith], "build": ok,
                 "tb": "–" if r.testbench_pass is None else ("PASS" if r.testbench_pass else "FAIL"),
@@ -679,6 +724,8 @@ def index(tab: str = "magnitude") -> None:
                 "sat": "–" if r.saturations is None else str(r.saturations),
                 "maxerr": fmt_num(r.max_err), "lsb": fmt_num(r.max_err / r.lsb, ".1f") if r.lsb and r.ok else "–",
                 "rms": fmt_num(r.rms_err), "snr": fmt_num(r.snr_db, ".1f"),
+                "pdev": fmt_num(pdev, ".3g"),
+                "satt": "–" if satt is None else (f"{satt:.1f}" + ("" if satt >= d_test.spec.as_ - 0.01 else "  ✘")),
             })
             log.append(f"[{r.arith}] {r.compile_cmd}".rstrip())
             if r.testbench_msg:
@@ -692,16 +739,50 @@ def index(tab: str = "magnitude") -> None:
 
         ok = [r for r in tr.results if r.ok]
         view = test_view.value
-        if view == "freq":
+        if view in ("freq", "dev"):
             spec = d_test.spec
-            opt = base_chart("Frequency (Hz)", "Magnitude (dB)")
-            bottom = -10 * math.ceil((spec.as_ + 60) / 10)
+            opt = base_chart("Frequency (Hz)", "Magnitude (dB)" if view == "freq" else "Measured − design (dB)")
             opt["xAxis"].update({"min": 0, "max": r6(spec.fs / 2)})
-            opt["yAxis"].update({"min": bottom, "max": 5})
-            opt["series"].append(line("Design", xy(tr.f_design, fdcore.magnitude_db(tr.h_design)), P()["design"]))
+            if view == "freq":
+                bottom = -10 * math.ceil((spec.as_ + 60) / 10)
+                opt["yAxis"].update({"min": bottom, "max": 5})
+                design = line("Design", xy(tr.f_design, fdcore.magnitude_db(tr.h_design)), P()["design"], width=6)
+                design["lineStyle"]["opacity"] = 0.35
+                design["z"] = 1
+                opt["series"].append(design)
+            else:
+                # stopband shaded: there the deviation shows the noise floor, not a design error
+                _, sm = band_masks(spec, tr.f_design)
+                areas, start = [], None
+                for fv, inside in zip(tr.f_design, sm):
+                    if inside and start is None:
+                        start = fv
+                    elif not inside and start is not None:
+                        areas.append([{"xAxis": r6(start)}, {"xAxis": r6(fv)}])
+                        start = None
+                if start is not None:
+                    areas.append([{"xAxis": r6(start)}, {"xAxis": r6(tr.f_design[-1])}])
+                zero = line("Design (0 dB)", xy(tr.f_design[[0, -1]], [0.0, 0.0]), P()["design"], width=1)
+                zero["markArea"] = {"silent": True, "itemStyle": {"color": P()["forbidden"]}, "data": areas,
+                                    "label": {"show": True, "position": "insideTop", "formatter": "stopband",
+                                              "color": P()["fg"]}}
+                opt["series"].append(zero)
+            dev_all = []
             for r in ok:
-                opt["series"].append(line(f"{r.arith} (C)", xy(r.f_meas, fdcore.magnitude_db(r.h_meas)),
-                                          IMPL_COLORS[r.arith], dashed=True, width=1.5))
+                with np.errstate(divide="ignore"):
+                    y = fdcore.magnitude_db(r.h_meas)
+                    if view == "dev":
+                        hd = np.abs(fdcore.response(d_test.sos, r.f_meas, spec.fs))
+                        y = 20 * np.log10(r.h_meas + 1e-300) - 20 * np.log10(hd + 1e-300)
+                        dev_all.append(y)
+                s = line(f"{r.arith} (C)", xy(r.f_meas, y), IMPL_COLORS[r.arith], width=1.8)
+                s["lineStyle"]["type"] = IMPL_DASH[r.arith]
+                s["z"] = 3
+                opt["series"].append(s)
+            if view == "dev":
+                # the deviation diverges at the zeros of the design: limit the axis to +/-60 dB
+                lo, hi = nice_limits([np.clip(v, -60, 60) for v in dev_all] + [np.zeros(1)], floor_span=1e-3)
+                opt["yAxis"].update({"min": lo, "max": hi})
         else:
             n_show = min(tr.n, 4096)
             k = np.arange(n_show)
@@ -712,12 +793,17 @@ def index(tab: str = "magnitude") -> None:
                 opt["series"].append(line("Reference (double)", xy(k, ok[0].ref[:n_show]), P()["design"]))
             for r in ok:
                 y = r.y[:n_show] if view == "out" else (r.y - r.ref)[:n_show]
-                opt["series"].append(line(f"{r.arith} (C)", xy(k, y), IMPL_COLORS[r.arith],
-                                          dashed=view == "out", width=1.5))
+                s = line(f"{r.arith} (C)", xy(k, y), IMPL_COLORS[r.arith], width=1.5)
+                s["lineStyle"]["type"] = IMPL_DASH[r.arith]
+                opt["series"].append(s)
             if tr.n > n_show:
                 opt["title"] = {"text": f"first {n_show} of {tr.n} samples", "right": 60, "top": 5,
                                 "textStyle": {"fontSize": 12, "color": P()["fg"]}}
-        show(test_chart, opt)
+        # recreate the chart: nicegui would merge this view into the previous one (stale axis
+        # limits, titles and shaded areas) because the number of series is often the same
+        test_chart_box.clear()
+        with test_chart_box:
+            ui.echart(apply_theme(opt, P())).classes("w-full h-[460px]")
 
     def update_test_inputs(_=None) -> None:
         kind = test_sig.value
@@ -847,7 +933,7 @@ def index(tab: str = "magnitude") -> None:
             put(phase_wrap, pick("view", "phase", str, lambda v: v in ("unwrap", "wrap")))
             put(gd_unit, pick("view", "group_delay_unit", str, lambda v: v in ("samples", "ms")))
             put(time_kind, pick("view", "time_response", str, lambda v: v in ("impulse", "step")))
-            put(test_view, pick("view", "test_view", str, lambda v: v in ("out", "err", "freq")))
+            put(test_view, pick("view", "test_view", str, lambda v: v in ("out", "err", "freq", "dev")))
 
             put(test_impls, pick("test", "implementations", lambda v: [a for a in v if a in ARITH_LABELS]))
             put(test_sig, pick("test", "signal", str, lambda v: v in ctest.SIGNALS))
